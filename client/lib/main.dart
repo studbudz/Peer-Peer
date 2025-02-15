@@ -20,12 +20,12 @@ class _P2PChatAppState extends State<P2PChatApp> {
   RTCPeerConnection? _peerConnection;
   RTCDataChannel? _dataChannel;
   String _clientId = '';
-  bool _peerConnected = false;
+  final bool _peerConnected = false;
   bool _isConnecting = false;
   bool _isDataChannelOpen = false;
   Completer<void>? _dataChannelOpenedCompleter;
   final List<String> _messages = [];
-  String? _clientRole = "A";
+  final String? _clientRole = "A";
 
   bool _remoteDescriptionSet = false;
   final List<RTCIceCandidate> _pendingCandidates = [];
