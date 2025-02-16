@@ -1,258 +1,365 @@
 import 'dart:convert';
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
-import 'dart:async';
 
 void main() => runApp(P2PChatApp());
 
-class P2PChatApp extends StatefulWidget {
-  const P2PChatApp({super.key});
-
-  @override
-  _P2PChatAppState createState() => _P2PChatAppState();
+/// Represents a single chat message.
+class ChatMessage {
+  final String text;
+  final bool isSentByMe;
+  ChatMessage({required this.text, required this.isSentByMe});
 }
 
-class _P2PChatAppState extends State<P2PChatApp> {
-  final TextEditingController _targetIdController = TextEditingController();
-  final TextEditingController _messageController = TextEditingController();
-  late WebSocketChannel _channel;
-  RTCPeerConnection? _peerConnection;
-  RTCDataChannel? _dataChannel;
-  String _clientId = '';
-  final bool _peerConnected = false;
-  bool _isConnecting = false;
-  bool _isDataChannelOpen = false;
-  Completer<void>? _dataChannelOpenedCompleter;
-  final List<String> _messages = [];
-  final String? _clientRole = "A";
+/// Encapsulates a WebRTC conversation with one peer.
+class Conversation {
+  final String peerId;
+  RTCPeerConnection? connection;
+  RTCDataChannel? dataChannel;
+  Completer<void>? dataChannelOpenedCompleter;
+  List<ChatMessage> messages = [];
 
-  bool _remoteDescriptionSet = false;
-  final List<RTCIceCandidate> _pendingCandidates = [];
+  // For ICE candidates received before the remote description is set.
+  bool remoteDescriptionSet = false;
+  final List<RTCIceCandidate> pendingCandidates = [];
 
-  @override
-  void initState() {
-    super.initState();
-    _connectToSignalingServer();
+  Conversation(this.peerId);
+
+  /// Initializes the connection.
+  /// [initiator] should be true if we are starting the conversation.
+  /// [onMessageReceived] is called when a new message arrives.
+  /// [sendSignal] is a callback to send signaling data.
+  Future<void> initialize({
+    required bool initiator,
+    required Function(String) onMessageReceived,
+    required Function(Map<String, dynamic>) sendSignal,
+  }) async {
+    connection = await createPeerConnection({
+      'iceServers': [
+        {'urls': 'stun:stun.l.google.com:19302'},
+      ]
+    });
+    connection!.onIceCandidate = (candidate) {
+      // Send each ICE candidate via signaling.
+      sendSignal({'candidate': candidate.toMap()});
+    };
+    connection!.onDataChannel = (channel) {
+      dataChannel = channel;
+      _setupDataChannel(onMessageReceived);
+    };
+
+    // If we're the initiator, create our own data channel.
+    if (initiator) {
+      dataChannel =
+          await connection!.createDataChannel("chat", RTCDataChannelInit());
+      _setupDataChannel(onMessageReceived);
+    }
   }
 
-  void _connectToSignalingServer() {
-    _channel = WebSocketChannel.connect(Uri.parse('ws://localhost:8080'));
+  void _setupDataChannel(Function(String) onMessageReceived) {
+    dataChannelOpenedCompleter = Completer<void>();
+    dataChannel!.onMessage = (msg) {
+      onMessageReceived(msg.text);
+      messages.add(ChatMessage(text: msg.text, isSentByMe: false));
+    };
+    dataChannel!.onDataChannelState = (state) {
+      if (state == RTCDataChannelState.RTCDataChannelOpen) {
+        dataChannelOpenedCompleter?.complete();
+      }
+    };
+  }
+
+  Future<RTCSessionDescription> createOffer() async {
+    RTCSessionDescription offer = await connection!.createOffer();
+    await connection!.setLocalDescription(offer);
+    return offer;
+  }
+
+  Future<RTCSessionDescription> createAnswer() async {
+    RTCSessionDescription answer = await connection!.createAnswer();
+    await connection!.setLocalDescription(answer);
+    return answer;
+  }
+
+  Future<void> setRemoteDescription(Map<String, dynamic> sdpData) async {
+    RTCSessionDescription sdp =
+        RTCSessionDescription(sdpData['sdp'], sdpData['type']);
+    await connection!.setRemoteDescription(sdp);
+    remoteDescriptionSet = true;
+    // Add any queued ICE candidates.
+    for (var candidate in pendingCandidates) {
+      await connection!.addCandidate(candidate);
+    }
+    pendingCandidates.clear();
+  }
+
+  Future<void> addCandidate(Map<String, dynamic> candidateData) async {
+    RTCIceCandidate candidate = RTCIceCandidate(
+      candidateData['candidate'],
+      candidateData['sdpMid'],
+      candidateData['sdpMLineIndex'] as int?,
+    );
+    if (remoteDescriptionSet) {
+      await connection!.addCandidate(candidate);
+    } else {
+      pendingCandidates.add(candidate);
+    }
+  }
+}
+
+/// Manages signaling and multiple conversations.
+class SignalingManager {
+  final String url;
+  late WebSocketChannel _channel;
+  String clientId = "";
+  Function(String)? onLocalId;
+
+  // Map peerId -> Conversation
+  Map<String, Conversation> conversations = {};
+
+  SignalingManager(this.url);
+
+  void connect() {
+    _channel = WebSocketChannel.connect(Uri.parse(url));
     _channel.stream.listen((message) {
       var data = jsonDecode(message);
       print("DEBUG: Received message: $data");
       switch (data['type']) {
         case 'welcome':
-          setState(() {
-            _clientId = data['id'];
-          });
-          print("DEBUG: Client ID set to: $_clientId");
+          clientId = data['id'];
+          if (onLocalId != null) onLocalId!(clientId);
+          print("DEBUG: Client ID set to: $clientId");
           break;
         case 'signal':
-          _handleSignal(data['from'], data['data']);
+          String from = data['from'];
+          Map<String, dynamic> signalData = data['data'];
+          // Retrieve or create the conversation.
+          Conversation conv = conversations[from] ?? Conversation(from);
+          conversations[from] = conv;
+
+          // If an SDP offer is received, we are the receiver.
+          if (signalData.containsKey('sdp')) {
+            String sdpType = signalData['sdp']['type'];
+            if (sdpType == 'offer') {
+              // Initialize conversation as receiver.
+              conv
+                  .initialize(
+                initiator: false,
+                onMessageReceived: (msg) {
+                  // Notify UI that a new message arrived.
+                  _notifyUpdate();
+                },
+                sendSignal: (signal) {
+                  sendSignalMessage(from, signal);
+                },
+              )
+                  .then((_) async {
+                await conv.setRemoteDescription(signalData['sdp']);
+                RTCSessionDescription answer = await conv.createAnswer();
+                sendSignalMessage(from, {'sdp': answer.toMap()});
+              });
+            } else if (sdpType == 'answer') {
+              // Answer to our offer.
+              conv.setRemoteDescription(signalData['sdp']);
+            }
+          }
+          // ICE candidate
+          if (signalData.containsKey('candidate')) {
+            conv.addCandidate(signalData['candidate']);
+          }
           break;
         default:
           print("DEBUG: Unhandled message type: ${data['type']}");
       }
+      _notifyUpdate();
     });
   }
 
-  void _createPeerConnection() async {
+  void sendSignalMessage(String target, Map<String, dynamic> data) {
+    _channel.sink.add(jsonEncode({
+      'type': 'signal',
+      'target': target,
+      'from': clientId,
+      'data': data,
+    }));
+    print("DEBUG: Sent signal to $target with data $data");
+  }
+
+  /// Initiates a conversation with [target] as the initiator.
+  Future<Conversation> startConversation(
+      String target, Function(String) onMessageReceived) async {
+    if (conversations.containsKey(target)) return conversations[target]!;
+    Conversation conv = Conversation(target);
+    conversations[target] = conv;
+    await conv.initialize(
+      initiator: true,
+      onMessageReceived: (msg) {
+        onMessageReceived(msg);
+        _notifyUpdate();
+      },
+      sendSignal: (signal) {
+        sendSignalMessage(target, signal);
+      },
+    );
+    RTCSessionDescription offer = await conv.createOffer();
+    sendSignalMessage(target, {'sdp': offer.toMap()});
+    return conv;
+  }
+
+  /// Sends a text message in the conversation with [target].
+  Future<void> sendMessage(String target, String msg) async {
+    if (!conversations.containsKey(target)) return;
+    Conversation conv = conversations[target]!;
+    if (conv.dataChannel == null) return;
+    await conv.dataChannelOpenedCompleter?.future;
+    conv.dataChannel!.send(RTCDataChannelMessage(msg));
+    conv.messages.add(ChatMessage(text: msg, isSentByMe: true));
+    _notifyUpdate();
+  }
+
+  // A simple mechanism to trigger UI updates.
+  VoidCallback? _updateCallback;
+  void registerUpdateCallback(VoidCallback cb) {
+    _updateCallback = cb;
+  }
+
+  void _notifyUpdate() {
+    if (_updateCallback != null) _updateCallback!();
+  }
+}
+
+/// The main UI.
+class P2PChatApp extends StatefulWidget {
+  const P2PChatApp({super.key});
+  @override
+  P2PChatAppState createState() => P2PChatAppState();
+}
+
+class P2PChatAppState extends State<P2PChatApp> {
+  final TextEditingController _targetIdController = TextEditingController();
+  final TextEditingController _messageController = TextEditingController();
+  late SignalingManager signalingManager;
+  String? selectedPeerId;
+
+  @override
+  void initState() {
+    super.initState();
+    signalingManager = SignalingManager('ws://localhost:8080');
+    signalingManager.onLocalId = (id) => setState(() {});
+    signalingManager.registerUpdateCallback(() {
+      setState(() {});
+    });
+    signalingManager.connect();
+  }
+
+  /// Initiate a conversation with the entered peer ID.
+  void _connectToPeer() async {
+    String targetId = _targetIdController.text;
+    if (targetId.isEmpty) return;
+    await signalingManager.startConversation(targetId, (msg) {
+      setState(() {}); // refresh UI when a new message arrives.
+    });
     setState(() {
-      _isConnecting = true;
+      selectedPeerId = targetId;
     });
-
-    print("DEBUG: Creating peer connection...");
-    _peerConnection = await createPeerConnection({
-      'iceServers': [
-        {'urls': 'stun:stun.l.google.com:19302'}
-      ]
-    });
-
-    print("DEBUG: PeerConnection created.");
-
-    _peerConnection!.onIceCandidate = (candidate) {
-      print("DEBUG: ICE Candidate found: ${candidate.toMap()}");
-      _sendSignal({'candidate': candidate.toMap()});
-    };
-
-    _peerConnection!.onDataChannel = (channel) {
-      print("DEBUG: onDataChannel callback triggered.");
-      _dataChannel = channel;
-      _setupDataChannel();
-    };
-
-    if (_clientRole == "A") {
-      print("DEBUG: Creating data channel for Client A.");
-      _dataChannel = await _peerConnection!
-          .createDataChannel("chat", RTCDataChannelInit());
-      print("DEBUG: Data channel created (Client A).");
-      _setupDataChannel();
-      RTCSessionDescription offer = await _peerConnection!.createOffer();
-      await _peerConnection!.setLocalDescription(offer);
-      _sendSignal({'sdp': offer.toMap()});
-    } else {
-      print("DEBUG: Waiting for offer from Client A (role B).");
-    }
   }
 
-  void _handleSignal(String from, Map<String, dynamic> data) async {
-    print("DEBUG: Handling signal from: $from");
-
-    setState(() {
-      _targetIdController.text = from;
-    });
-
-    if (data.containsKey('sdp')) {
-      print("DEBUG: Received SDP type: ${data['sdp']['type']}");
-      RTCSessionDescription sdp = RTCSessionDescription(
-        data['sdp']['sdp'],
-        data['sdp']['type'],
-      );
-
-      if (sdp.type == 'offer') {
-        print("DEBUG: Received Offer. Initializing Peer Connection...");
-
-        if (_peerConnection == null) {
-          _createPeerConnection();
-        }
-
-        print("DEBUG: Setting Remote Description (Offer)...");
-        await _peerConnection!.setRemoteDescription(sdp);
-        _remoteDescriptionSet = true;
-
-        for (var candidate in _pendingCandidates) {
-          await _peerConnection!.addCandidate(candidate);
-        }
-        _pendingCandidates.clear();
-
-        print("DEBUG: Creating Answer...");
-        RTCSessionDescription answer = await _peerConnection!.createAnswer();
-        await _peerConnection!.setLocalDescription(answer);
-        _sendSignal({'sdp': answer.toMap()});
-      } else if (sdp.type == 'answer') {
-        print("DEBUG: Setting Remote Description (Answer)...");
-        await _peerConnection!.setRemoteDescription(sdp);
-        _remoteDescriptionSet = true;
-
-        for (var candidate in _pendingCandidates) {
-          await _peerConnection!.addCandidate(candidate);
-        }
-        _pendingCandidates.clear();
-      }
-    }
-
-    if (data.containsKey('candidate')) {
-      print("DEBUG: Received ICE Candidate...");
-      RTCIceCandidate candidate = RTCIceCandidate(
-        data['candidate']['candidate'],
-        data['candidate']['sdpMid'],
-        data['candidate']['sdpMLineIndex'] as int?,
-      );
-
-      if (_remoteDescriptionSet) {
-        await _peerConnection!.addCandidate(candidate);
-      } else {
-        _pendingCandidates.add(candidate);
-      }
-    }
-  }
-
-  void _setupDataChannel() {
-    print("DEBUG: Setting up the data channel...");
-    _dataChannelOpenedCompleter = Completer<void>();
-
-    _dataChannel!.onMessage = (msg) {
-      print("DEBUG: Data channel message received: ${msg.text}");
-      setState(() {
-        _messages.add("Peer: ${msg.text}");
-      });
-    };
-
-    _dataChannel!.onDataChannelState = (state) {
-      print("DEBUG: Data channel state changed: $state");
-
-      if (state == RTCDataChannelState.RTCDataChannelOpen) {
-        print("DEBUG: Data channel is open.");
-        setState(() {
-          _isDataChannelOpen = true;
-        });
-        _dataChannelOpenedCompleter?.complete();
-      } else if (state == RTCDataChannelState.RTCDataChannelClosed) {
-        print("DEBUG: Data channel is closed.");
-        setState(() {
-          _isDataChannelOpen = false;
-        });
-      }
-    };
-  }
-
-  void _sendSignal(Map<String, dynamic> data) {
-    if (_targetIdController.text.isNotEmpty) {
-      _channel.sink.add(jsonEncode({
-        'type': 'signal',
-        'target': _targetIdController.text,
-        'from': _clientId,
-        'data': data
-      }));
-      print(
-          "DEBUG: Sent signal with target: ${_targetIdController.text} and client ID: $_clientId");
-    }
-  }
-
+  /// Sends a message in the active conversation.
   void _sendMessage() async {
-    if (!_isDataChannelOpen) {
-      print("DEBUG: Data channel is not open, waiting...");
-      await _dataChannelOpenedCompleter?.future;
-    }
+    if (selectedPeerId == null) return;
+    String msg = _messageController.text;
+    if (msg.isEmpty) return;
+    await signalingManager.sendMessage(selectedPeerId!, msg);
+    setState(() {
+      _messageController.clear();
+    });
+  }
 
-    if (_messageController.text.isNotEmpty) {
-      String msg = _messageController.text;
-      print("DEBUG: Sending data channel message: $msg");
-
-      if (_dataChannel != null) {
-        _dataChannel!.send(RTCDataChannelMessage(msg));
-        setState(() {
-          _messages.add("You: $msg");
-        });
-        _messageController.clear();
-      }
-    }
+  /// Builds a message bubble.
+  Widget _buildMessageBubble(ChatMessage msg) {
+    return Align(
+      alignment: msg.isSentByMe ? Alignment.centerRight : Alignment.centerLeft,
+      child: Container(
+        margin: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
+        padding: const EdgeInsets.all(10),
+        decoration: BoxDecoration(
+          color: msg.isSentByMe ? Colors.blue[200] : Colors.grey[300],
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Text(msg.text),
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
+    // Get messages for the selected conversation.
+    List<ChatMessage> messages = [];
+    if (selectedPeerId != null &&
+        signalingManager.conversations.containsKey(selectedPeerId)) {
+      messages = signalingManager.conversations[selectedPeerId]!.messages;
+    }
     return MaterialApp(
+      title: "P2P Chat (${signalingManager.clientId})",
       home: Scaffold(
-        appBar: AppBar(title: Text("P2P Chat ($_clientId)")),
+        appBar: AppBar(title: Text("P2P Chat (${signalingManager.clientId})")),
         body: Padding(
           padding: const EdgeInsets.all(16.0),
           child: Column(
             children: [
-              TextField(
-                controller: _targetIdController,
-                decoration: InputDecoration(labelText: "Enter Peer ID"),
+              // Peer connection controls.
+              Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _targetIdController,
+                      decoration: InputDecoration(labelText: "Enter Peer ID"),
+                    ),
+                  ),
+                  ElevatedButton(
+                    onPressed: _connectToPeer,
+                    child: Text("Connect"),
+                  ),
+                ],
               ),
-              !_peerConnected
-                  ? ElevatedButton(
-                      onPressed: _createPeerConnection,
-                      child: Text("Connect to Peer"),
-                    )
-                  : Container(),
+              // Dropdown for active conversations.
+              DropdownButton<String>(
+                hint: Text("Select Conversation"),
+                value: selectedPeerId,
+                items: signalingManager.conversations.keys.map((peerId) {
+                  return DropdownMenuItem<String>(
+                    value: peerId,
+                    child: Text(peerId),
+                  );
+                }).toList(),
+                onChanged: (value) {
+                  setState(() {
+                    selectedPeerId = value;
+                  });
+                },
+              ),
+              // Display conversation messages.
               Expanded(
                 child: ListView(
-                  children: _messages
-                      .map((msg) => ListTile(title: Text(msg)))
-                      .toList(),
+                  children: messages.map(_buildMessageBubble).toList(),
                 ),
               ),
-              TextField(
-                controller: _messageController,
-                decoration: InputDecoration(labelText: "Type a message"),
-              ),
-              ElevatedButton(
-                onPressed: _sendMessage,
-                child: Text("Send Message"),
+              // Message input field and Send button.
+              Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _messageController,
+                      decoration: InputDecoration(labelText: "Type a message"),
+                    ),
+                  ),
+                  ElevatedButton(
+                    onPressed: _sendMessage,
+                    child: Text("Send"),
+                  ),
+                ],
               ),
             ],
           ),
