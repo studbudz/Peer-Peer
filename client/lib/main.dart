@@ -16,13 +16,18 @@ class ChatMessage {
 /// Encapsulates a WebRTC conversation with one peer.
 class Conversation {
   final String peerId;
+  //Represents a WebRTC peer connection.
   RTCPeerConnection? connection;
+  //specific to transmitting data between peers.
   RTCDataChannel? dataChannel;
+  //Completer that resolves when the data channel is opened.
   Completer<void>? dataChannelOpenedCompleter;
+  //List of chat messages in this conversation.
   List<ChatMessage> messages = [];
 
   // For ICE candidates received before the remote description is set.
   bool remoteDescriptionSet = false;
+  // List of ICE candidates received before the remote description is set.
   final List<RTCIceCandidate> pendingCandidates = [];
 
   Conversation(this.peerId);

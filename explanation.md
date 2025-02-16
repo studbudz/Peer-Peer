@@ -7,6 +7,25 @@
 
 This document provides a detailed explanation of the code that implements a WebRTC-based chat application. The code consists of several key components, including the `Server`, `SignalingManager`, `Conversation`, and `ChatMessage` classes, each of which plays a crucial role in managing real-time peer-to-peer communication.
 
+There are a few terms which may be foreign. I've listed them below:
+- **WebRTC**: Web Real-Time Communication, enables peer-to-peer communication.
+- **RTCPeerConnection**: Represents a connection between the local device and a remote peer.
+- **RTCDataChannel**: Allows the transmission of arbitrary data between peers.
+- **ICE (Interactive Connectivity Establishment)**: Used to find the best path to connect peers.
+- **STUN (Session Traversal Utilities for NAT)**: A protocol that allows users to discover their own IP address.
+- **TURN (Traversal Using Relays around NAT)**: A protocol that relays traffic between peers when direct peer-to-peer communication is not possible.
+- **SDP (Session Description Protocol)**: A format for describing the multimedia content of the connection such as codec, format information, network information, etc.
+- **Completer**: A Dart class used to create and control a `Future` manually.
+- **Future**: A Dart object representing a value or error that will be available at some point in the future.
+- **WebSocket**: A protocol providing full-duplex communication channels over a single TCP connection.
+- **WebSocketChannel**: A Dart class used to interact with WebSocket servers.
+- **VoidCallback**: A Dart type alias for a function that takes no arguments and returns no value.
+- **jsonEncode**: A Dart function that converts an object to a JSON string.
+- **jsonDecode**: A Dart function that parses a JSON string and returns the resulting object.
+- **RTCSessionDescription**: A WebRTC class that describes one end of a connection, including the media format and network information.
+- **RTCIceCandidate**: A WebRTC class that represents a candidate for connection establishment.
+
+
 - **`Server`**: Handles the setup of the server, receiving requests, and managing client connections. It also facilitates the initialization of WebSocket communication for signaling.
 - **`SignalingManager`**: Responsible for the signaling process, including sending and receiving connection signals between peers, managing active conversations, and providing callbacks for updates.
 - **`Conversation`**: Represents a chat between two peers, storing messages and handling the creation of offers and answers for WebRTC peer connections.
